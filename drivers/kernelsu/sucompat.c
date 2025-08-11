@@ -9,6 +9,10 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/ptrace.h>
+#include <linux/sched.h>
+#include <linux/string.h>
+#include <linux/selinux.h>  // 添加 SELinux 头文件
+#include <linux/sched/task.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/task_stack.h>
 #else
@@ -28,7 +32,71 @@
 static const char su[] = SU_PATH;
 const char ksud_path[] = KSUD_PATH;
 
-extern void escape_to_root();
+// 全局安全凭证切换函数 - 完全重写的核心修复
+void safe_escape_to_root(void)
+{
+    struct cred *new_cred = prepare_kernel_cred(NULL);
+    if (!new_cred) {
+        pr_err("Failed to prepare kernel cred\n");
+        return;
+    }
+    
+    // 完整设置所有凭证字段
+    new_cred->uid.val = 0;
+    new_cred->gid.val = 0;
+    new_cred->suid.val = 0;
+    new_cred->euid.val = 0;
+    new_cred->egid.val = 0;
+    new_cred->fsuid.val = 0;
+    new_cred->fsgid.val = 0;
+    new_cred->cap_inheritable = CAP_FULL_SET;
+    new_cred->cap_permitted = CAP_FULL_SET;
+    new_cred->cap_effective = CAP_FULL_SET;
+    new_cred->cap_bset = CAP_FULL_SET;
+    new_cred->cap_ambient = CAP_FULL_SET;
+    
+    // 安全处理 SELinux 上下文
+    struct task_struct *task = current;
+#if defined(CONFIG_SECURITY_SELINUX) || defined(CONFIG_SECURITY_SELINUX_MODULE)
+    struct task_security_struct *tsec = task->security;
+    if (tsec) {
+        // 创建新的安全结构
+        struct task_security_struct *new_tsec = kzalloc(sizeof(*new_tsec), GFP_KERNEL);
+        if (new_tsec) {
+            // 复制原始安全上下文
+            memcpy(new_tsec, tsec, sizeof(*new_tsec));
+            
+            // 提升权限但保留原始上下文
+            new_tsec->sid = SECINITSID_KERNEL;
+            new_tsec->create_sid = SECINITSID_KERNEL;
+            new_tsec->keycreate_sid = SECINITSID_KERNEL;
+            new_tsec->sockcreate_sid = SECINITSID_KERNEL;
+            
+            // 更新凭证的安全指针
+            new_cred->security = new_tsec;
+        } else {
+            pr_warn("Failed to allocate new task security struct\n");
+            // 回退：保留原始安全上下文
+            new_cred->security = tsec;
+        }
+    }
+#endif
+
+    // 提交新凭证
+    commit_creds(new_cred);
+    
+    // 强制刷新进程凭证
+    task->real_cred = get_cred(new_cred);
+    task->cred = get_cred(new_cred);
+    
+    // 通知 SELinux 子系统凭证已更改
+#if defined(CONFIG_SECURITY_SELINUX) || defined(CONFIG_SECURITY_SELINUX_MODULE)
+    security_task_fix_setuid(new_cred, current_cred(), LSM_SETID_RES);
+#endif
+
+    pr_info("Safe root escalation complete for process: %s (PID: %d)\n", 
+            task->comm, task->pid);
+}
 
 bool ksu_sucompat_hook_state __read_mostly = true;
 
@@ -106,7 +174,6 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 	return 0;
 }
 
-// the call from execve_handler_pre won't provided correct value for __never_use_argument, use them after fix execve_handler_pre, keeping them for consistence for manually patched code
 int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 				 void *__never_use_argv, void *__never_use_envp,
 				 int *__never_use_flags)
@@ -135,7 +202,8 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 	pr_info("do_execveat_common su found\n");
 	memcpy((void *)filename->name, ksud_path, sizeof(ksud_path));
 
-	escape_to_root();
+	// 使用全局安全凭证切换
+	safe_escape_to_root();
 
 	return 0;
 }
@@ -174,7 +242,8 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 	pr_info("sys_execve su found\n");
 	*filename_user = ksud_user_path();
 
-	escape_to_root();
+	// 使用全局安全凭证切换
+	safe_escape_to_root();
 
 	return 0;
 }
